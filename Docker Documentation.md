@@ -1,0 +1,340 @@
+
+## 1. Proxmox snapshot
+
+Before changing anything, I took a snapshot of the VM in Proxmox (VM > **Snapshots** > **Take Snapshot**), then did all work over SSH.
+
+```bash
+# Connect to the VM from my computer
+ssh crw9423@10.30.48.234
+```
+
+## 2. Install Docker
+
+```bash
+# Update the system and install tools needed to fetch Docker's key
+sudo dnf update && sudo dnf install -y ca-certificates curl
+
+# Create a directory for the repository signing key
+sudo install -m 0755 -d /etc/dnf/keyrings
+
+# Download Docker's GPG key so dnf can verify packages
+sudo curl -fsSL https://download.docker.com/linux/fedora/gpg \
+  -o /etc/dnf/keyrings/docker.asc
+
+# Add Docker's Fedora repository (\$ keeps the variables for dnf to fill in)
+sudo tee /etc/yum.repos.d/docker-ce.repo <<EOF
+[docker-ce-stable]
+name=Docker CE Stable - \$basearch
+baseurl=https://download.docker.com/linux/fedora/\$releasever/\$basearch/stable
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/dnf/keyrings/docker.asc
+EOF
+
+# Refresh package metadata
+sudo dnf makecache
+
+# Install Docker Engine, CLI, containerd, buildx and compose
+sudo dnf install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+---
+
+## 3. Post-install checks
+
+```bash
+# Start Docker now and at every boot
+sudo systemctl enable --now docker
+
+# Confirm it is enabled (prints: enabled)
+systemctl is-enabled docker
+
+# Run a test container
+sudo docker run --rm hello-world
+
+# Confirm the compose plugin works
+docker compose version
+
+# Optional: run docker without sudo (log out and back in after)
+sudo usermod -aG docker $USER
+```
+
+## 4. Run GitLab
+
+```bash
+# Create the project folder
+mkdir -p ~/gitlab && cd ~/gitlab
+
+# Write the compose file
+cat > compose.yaml <<'EOF'
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    container_name: gitlab
+    restart: always
+    hostname: localhost
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+    ports:
+      - "80:80"
+      - "127.0.0.1:2222:22"
+    volumes:
+      - ./config:/etc/gitlab:Z
+      - ./logs:/var/log/gitlab:Z
+      - ./data:/var/opt/gitlab:Z
+    shm_size: '256m'
+EOF
+
+# Start GitLab in the background
+sudo docker compose up -d
+
+# Show status; wait for (healthy) (takes several minutes)
+sudo docker compose ps
+
+# Print the one-time initial root password
+sudo docker exec -it gitlab cat /etc/gitlab/initial_root_password
+```
+
+### compose.yaml (secrets redacted)
+
+```yaml
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    container_name: gitlab
+    restart: always
+    hostname: localhost
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+    ports:
+      - "80:80"
+      - "127.0.0.1:2222:22"
+    volumes:
+      - ./config:/etc/gitlab:Z
+      - ./logs:/var/log/gitlab:Z
+      - ./data:/var/opt/gitlab:Z
+    shm_size: '256m'
+```
+
+Only port 80 is published to the network; GitLab's SSH port is bound to `127.0.0.1`. `:Z` relabels the volumes for SELinux.
+
+### Open GitLab in the browser
+
+```bash
+# On my computer: tunnel local port 8080 to the VM's port 80, then browse to http://localhost:8080
+ssh -L 8080:localhost:80 crw9423@10.30.48.234
+```
+
+I logged in as `root` (password: `<redacted>`) and changed the password.
+
+## 5. Secure the VM
+
+### SSH key login
+
+```bash
+# On the VM: make sure sshd is running and enabled
+sudo systemctl enable --now sshd
+
+# On my computer: generate a key pair (accept the default path)
+ssh-keygen -t ed25519
+```
+
+```powershell
+# On my computer (PowerShell): copy the public key to the VM
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh crw9423@10.30.48.234 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+```
+
+```bash
+# On my computer: confirm key login works (second terminal, before disabling passwords)
+ssh crw9423@10.30.48.234
+
+# On the VM: edit the SSH server config
+sudo nano /etc/ssh/sshd_config
+
+# Check the config syntax (no output = OK)
+sudo sshd -t
+
+# Apply the change
+sudo systemctl restart sshd
+
+# Show the value in effect (prints: passwordauthentication no)
+sudo sshd -T | grep -i passwordauthentication
+```
+
+**sshd_config change**
+
+```text
+PasswordAuthentication no
+```
+
+**Refused password login**
+
+```bash
+# On my computer: disable key auth so only a password can be tried
+ssh -o PubkeyAuthentication=no crw9423@10.30.48.234
+```
+
+```text
+crw9423@10.30.48.234: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+```
+
+### Firewall (firewalld)
+
+```bash
+# Start the firewall now and at boot
+sudo systemctl enable --now firewalld
+
+# Allow SSH
+sudo firewall-cmd --permanent --add-service=ssh
+
+# Allow HTTP (the app's port)
+sudo firewall-cmd --permanent --add-service=http
+
+# Apply the rules
+sudo firewall-cmd --reload
+
+# Show the active rules
+sudo firewall-cmd --list-all
+
+# Show listening ports (2222 should be 127.0.0.1 only)
+sudo ss -tlnp | grep -E ':80|:2222'
+```
+
+### Automatic updates
+
+```bash
+# Install the automatic-updates plugin
+sudo dnf install -y dnf5-plugin-automatic
+
+# Copy the default config into /etc for editing
+sudo cp /usr/share/dnf5/dnf5-plugins/automatic.conf /etc/dnf/dnf5-plugins/automatic.conf
+
+# Set apply_updates = yes so updates are installed, not just downloaded
+sudo nano /etc/dnf/dnf5-plugins/automatic.conf
+
+# Start the timer now and at boot
+sudo systemctl enable --now dnf5-automatic.timer
+
+# Confirm the timer is active
+systemctl status dnf5-automatic.timer
+```
+
+**Config change**
+
+```ini
+[commands]
+apply_updates = yes
+```
+
+## 6. Backups
+
+```bash
+# Create the script folder and the archive folder
+sudo mkdir -p /root/bin /var/backups/gitlab
+
+# Create the script (contents below)
+sudo nano /root/bin/gitlab-backup.sh
+
+# Make it executable
+sudo chmod +x /root/bin/gitlab-backup.sh
+
+# Run it twice (a minute apart) to get more than one archive
+sudo /root/bin/gitlab-backup.sh
+sudo /root/bin/gitlab-backup.sh
+
+# List the archives
+ls -lh /var/backups/gitlab
+```
+
+### gitlab-backup.sh
+
+```bash
+#!/bin/bash
+set -euo pipefail                      # stop on any error
+
+APP_DIR=/home/crw9423/gitlab           # app folder
+BACKUP_DIR=/var/backups/gitlab         # archive folder
+STAMP=$(date +%Y-%m-%d_%H%M%S)         # unique timestamp
+
+cd "$APP_DIR"
+docker compose stop                    # stop the app
+trap 'cd "$APP_DIR" && docker compose start' EXIT   # always restart, even on error
+
+# Archive the data folders
+tar -czf "$BACKUP_DIR/gitlab-$STAMP.tar.gz" -C "$APP_DIR" config logs data
+
+# Keep only the 7 newest archives
+ls -1t "$BACKUP_DIR"/gitlab-*.tar.gz | tail -n +8 | xargs -r rm --
+```
+
+```text
+<paste ls -lh /var/backups/gitlab output>
+```
+
+### Proxmox backup
+
+VM > **Backup** > **Backup now**.
+
+
+## 7. Restore drill
+
+1. In the browser, I created a project named `restore-test` with a README.
+
+```bash
+# Back up so the newest archive includes restore-test
+sudo /root/bin/gitlab-backup.sh
+
+# Confirm the new archive exists
+ls -lh /var/backups/gitlab
+
+# Show the "before" state
+cd ~/gitlab
+ls -la
+sudo docker compose ps
+```
+
+[Before: restore-test exists](https://claude.ai/chat/images/restore-before.png)
+
+2. I deleted GitLab's data: the `config`, `logs`, and `data` folders.
+
+```bash
+# Stop and remove the container
+sudo docker compose down
+
+# Delete all of GitLab's data
+sudo rm -rf config logs data
+
+# Prove it is gone
+ls -la
+sudo docker ps -a
+curl -I http://localhost
+```
+
+3. I restored from the newest archive.
+
+```bash
+# Extract the newest archive back into ~/gitlab
+sudo tar -xzf "$(ls -1t /var/backups/gitlab/gitlab-*.tar.gz | head -1)" -C ~/gitlab
+
+# Start GitLab with the restored data
+sudo docker compose up -d
+
+# Wait for (healthy)
+sudo docker compose ps
+```
+
+4. I logged in again and opened `restore-test`.
+
+## Sources
+
+- [Install Docker Engine on Fedora](https://docs.docker.com/engine/install/fedora/)
+- [Install GitLab using Docker](https://docs.gitlab.com/install/docker/)
+- [Docker bind mounts and SELinux labels](https://docs.docker.com/engine/storage/bind-mounts/)
+- [sshd_config manual](https://man.openbsd.org/sshd_config)
+- [Fedora firewalld docs](https://docs.fedoraproject.org/en-US/quick-docs/firewalld/)
+- [DNF5 automatic plugin](https://dnf5.readthedocs.io/en/latest/dnf5_plugins/automatic.8.html)
